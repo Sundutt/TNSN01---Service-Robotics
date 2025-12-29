@@ -1,0 +1,635 @@
+#include <QTRSensors.h>
+#include <CytronMotorDriver.h>
+#include <Servo.h>
+CytronMD motorLeft(PWM_DIR, 5, 6);
+CytronMD motorRight(PWM_DIR, 3, 11);
+
+QTRSensors qtr;
+const uint8_t SensorCount = 6;
+uint16_t sensorValues[SensorCount];
+const uint16_t BLACK_LINE = 750;
+const uint16_t WHITE_LINE = 300;
+
+Servo gripper;
+const int GRIPPER_PIN = 8;
+const int open = 105;
+const int closed = 70;
+
+const int LED_OTHER = 9;
+const int BUMPER_PIN = 7;
+const int BUTTON_PIN = 12;
+
+// PID CONSTANTS
+float Kp = 0.1;
+float Kd = 1;
+
+int16_t lastError = 0;
+float integral = 0;
+
+const int BASE_SPEED = 150;
+const int MAX_SPEED = 255;
+const int TURN_SPEED = 100;
+
+// CASE HANDELING
+enum RobotMode {
+  MODE_FINDFIRST,
+  MODE_ISLAND,
+  MODE_EXPLORE,
+  MODE_TEST
+};
+RobotMode mode = MODE_FINDFIRST;
+bool RETURNING = false;
+int NODE = 0;
+int numSaved = 0;
+
+bool middleEmpty = false;
+bool exploreEmpty = false;
+
+// ------------------------------------------------------------ FUNCTIONS ------------------------------------------------------------
+// LINE DETECTION FUNCTIONS
+int countBlackLines(){
+  int count = 0;
+  for(int8_t i = 0; i < SensorCount; i++){
+    if(sensorValues[i] > BLACK_LINE) count++;
+  }
+  return count;
+}
+
+bool leftSideBlack() {
+  return sensorValues[0] > BLACK_LINE && sensorValues[1] > BLACK_LINE;
+}
+
+bool rightSideBlack() {
+  return sensorValues[4] > BLACK_LINE && sensorValues[5] > BLACK_LINE;
+}
+
+bool middleOn() {
+  return (sensorValues[2] > BLACK_LINE && sensorValues[3] > BLACK_LINE);
+}
+
+bool middleOff() {
+  return (sensorValues[2] < WHITE_LINE && sensorValues[3] < WHITE_LINE);
+}
+
+// MOTOR FUNCTIONS 
+void setMotorSpeeds(int leftSpeed, int rightSpeed){
+  if(leftSpeed >= 0){
+    motorLeft.setSpeed(constrain(leftSpeed, 0, MAX_SPEED));
+  }else{
+    motorLeft.setSpeed(constrain(-255-leftSpeed, -MAX_SPEED, 0));
+  }
+  if(rightSpeed >= 0){
+    motorRight.setSpeed(constrain(rightSpeed, 0, MAX_SPEED));
+  }else{
+    motorRight.setSpeed(constrain(-255-rightSpeed, -MAX_SPEED, 0));
+  }
+}
+
+void turnAround(){
+  setMotorSpeeds(-TURN_SPEED, TURN_SPEED);
+  while(true){
+    qtr.readCalibrated(sensorValues);
+    if(middleOff()) break;
+  }
+  while(true){
+    qtr.readCalibrated(sensorValues);
+    if(middleOn()) break;
+  }
+  setMotorSpeeds(0, 0);
+}
+
+void turnLeftUntilLine() {
+  setMotorSpeeds(-TURN_SPEED, TURN_SPEED);
+  while(true){
+    qtr.readCalibrated(sensorValues);
+    if(middleOff()) break;
+  }
+  while(true){
+    qtr.readCalibrated(sensorValues);
+    if(middleOn()) break;
+  }
+  setMotorSpeeds(0, 0);
+}
+
+void turnRightUntilLine() {
+  setMotorSpeeds(TURN_SPEED, -TURN_SPEED);
+  while(true){
+    qtr.readCalibrated(sensorValues);
+    if(middleOff()) break;
+  }
+  while(true){
+    qtr.readCalibrated(sensorValues);
+    if(middleOn()) break;
+  }
+  setMotorSpeeds(0, 0);
+}
+
+// GRIPPER FUNCTION
+void pickupObject(){
+  setMotorSpeeds(0, 0);
+  setMotorSpeeds(-BASE_SPEED, -BASE_SPEED);
+  delay(150);
+  setMotorSpeeds(0, 0);
+  openGripper();
+  setMotorSpeeds(BASE_SPEED, BASE_SPEED);
+  delay(500);
+  setMotorSpeeds(0, 0);
+  closeGripper();
+}
+void dropObject(){
+  setMotorSpeeds(0, 0);
+  openGripper();
+  setMotorSpeeds(-BASE_SPEED, -BASE_SPEED);
+  delay(500);
+  setMotorSpeeds(0, 0);
+  closeGripper();
+}
+void openGripper(){
+  for(int pos = closed; pos <= open; pos += 1){
+    gripper.write(pos);
+    delay(10);
+  }
+}
+void closeGripper(){
+  for(int pos = open; pos >= closed; pos -= 1){
+    gripper.write(pos);
+    delay(10);
+  }
+}
+// CALIBRATION FUNCTION
+void calibrateAndRotate(){
+  const int fullSweepIters  = 40;
+  const int halfSweepIters  = fullSweepIters/2;
+
+  int leftMotorSpeed = -TURN_SPEED;
+  int rightMotorSpeed = TURN_SPEED;
+
+  int nextSwitch = halfSweepIters;
+  for (int i = 0; i < fullSweepIters*8.5; i++) {
+    if(i == nextSwitch){
+      setMotorSpeeds(0, 0);
+      leftMotorSpeed = -leftMotorSpeed;
+      rightMotorSpeed = -rightMotorSpeed;
+      nextSwitch += fullSweepIters;
+    }
+    setMotorSpeeds(leftMotorSpeed, rightMotorSpeed);
+    qtr.calibrate();
+  }
+  setMotorSpeeds(0, 0);
+  setMotorSpeeds(-leftMotorSpeed, -rightMotorSpeed);
+  while (true) {
+    qtr.readCalibrated(sensorValues);
+    if (middleOn()) {
+      break;
+    }
+  }
+  setMotorSpeeds(0, 0);
+}
+
+// BUTTON FUNCTION
+void buttonWait(){
+  int lastButtonState = HIGH;
+  int curButtonState = HIGH;
+  while(true){
+    curButtonState = digitalRead(BUTTON_PIN);
+    if(curButtonState != lastButtonState){
+      lastButtonState = curButtonState;
+      if(curButtonState == HIGH) break;
+    }
+  }
+}
+bool bumperPressed(){
+  return digitalRead(BUMPER_PIN) == LOW;
+}
+// TRAVERSING FUNCTIONS
+void leftHandRule(bool leftBlack, bool rightBlack){
+  bool rightLineMissed = false;
+  bool leftLineMissed = false;
+  setMotorSpeeds(BASE_SPEED, BASE_SPEED);
+  do{
+    qtr.readCalibrated(sensorValues);
+    if(leftSideBlack() && !leftLineMissed) leftLineMissed = true;
+    if(rightSideBlack() && !rightLineMissed) rightLineMissed = true;
+  }while(sensorValues[0] > BLACK_LINE || sensorValues[5] > BLACK_LINE);
+  delay(100);
+  setMotorSpeeds(0, 0);
+  if(leftBlack || leftLineMissed){
+    turnLeftUntilLine();
+  }
+  else if(middleOn()){
+    setMotorSpeeds(BASE_SPEED, BASE_SPEED);
+  }
+  else if(rightBlack || rightLineMissed){
+    turnRightUntilLine();
+  }
+}
+
+void rightHandRule(bool leftBlack, bool rightBlack){
+  bool rightLineMissed = false;
+  bool leftLineMissed = false;
+  setMotorSpeeds(BASE_SPEED, BASE_SPEED);
+  do{
+    qtr.readCalibrated(sensorValues);
+    if(rightSideBlack() && !rightLineMissed) rightLineMissed = true;
+    if(leftSideBlack() && !leftLineMissed) leftLineMissed = true;
+  }while(sensorValues[0] > BLACK_LINE || sensorValues[5] > BLACK_LINE);
+  delay(100);
+  setMotorSpeeds(0, 0);
+
+  if(rightBlack || rightLineMissed){
+    turnRightUntilLine();
+  }
+  else if(middleOn()){
+    setMotorSpeeds(BASE_SPEED, BASE_SPEED);
+  }
+  else if(leftBlack || leftLineMissed){
+    turnLeftUntilLine();
+  }
+}
+void followLine(int position){
+  int16_t error = 2500 - position;  // for 6 sensors, 0–5000 → center = 2500
+  int derivative = error - lastError;
+
+  int output = Kp * error + Kd * derivative;
+  lastError = error;
+  int leftSpeed  = BASE_SPEED - output;
+  int rightSpeed = BASE_SPEED + output;
+  if(mode == MODE_EXPLORE && (NODE == 21 || NODE == 115)){
+    leftSpeed = TURN_SPEED - output;
+    rightSpeed = TURN_SPEED + output;
+  }
+  setMotorSpeeds(leftSpeed, rightSpeed);
+}
+
+void victoryRoyal(){
+  digitalWrite(LED_BUILTIN, LOW);
+  digitalWrite(LED_OTHER, LOW);
+  setMotorSpeeds(TURN_SPEED, -TURN_SPEED);
+  while(true){
+    digitalWrite(LED_BUILTIN, HIGH);
+    openGripper();
+    delay(50);
+
+    digitalWrite(LED_OTHER, HIGH);
+    closeGripper();
+    delay(50);
+
+    digitalWrite(LED_BUILTIN, LOW);
+    openGripper();
+    delay(50);
+
+    digitalWrite(LED_OTHER, LOW);
+    closeGripper();
+    delay(50);
+  }
+}
+
+// ------------------------------------------------------------ SETUP AND LOOP ------------------------------------------------------------
+void setup() {
+  Serial.begin(9600);
+
+  qtr.setTypeAnalog();
+  qtr.setSensorPins((const uint8_t[]){A0, A1, A2, A3, A4, A5}, SensorCount);
+
+  pinMode(LED_BUILTIN, OUTPUT);
+  pinMode(LED_OTHER, OUTPUT);
+  pinMode(BUMPER_PIN, INPUT_PULLUP);
+  pinMode(BUTTON_PIN, INPUT_PULLUP);
+
+  gripper.attach(GRIPPER_PIN);
+  gripper.write(closed);
+  openGripper();
+  closeGripper();
+
+  digitalWrite(LED_BUILTIN, HIGH);
+  buttonWait();
+  digitalWrite(LED_BUILTIN, LOW);
+  delay(150);
+  calibrateAndRotate();
+  digitalWrite(LED_BUILTIN, HIGH);
+  buttonWait();
+  digitalWrite(LED_BUILTIN, LOW);
+  delay(150);
+
+  mode = MODE_FINDFIRST;
+}
+
+void loop() {
+  switch(mode){
+    case MODE_FINDFIRST:
+      handleModeFindFirst();
+    break;
+    case MODE_ISLAND:
+      handleModeIsland();
+    break;
+    case MODE_EXPLORE:
+      handleModeExplore();
+    break;
+    break;
+    case MODE_TEST:
+      uint16_t position = qtr.readLineBlack(sensorValues);
+      bool leftBlack    = leftSideBlack();
+      bool rightBlack   = rightSideBlack();
+      int numBlackLines = countBlackLines();
+
+      if((numBlackLines >= 3) && (leftBlack || rightBlack)){
+        leftHandRule(leftBlack, rightBlack);
+        return;
+      }
+      if(numBlackLines == 0){
+        setMotorSpeeds(BASE_SPEED+10, BASE_SPEED);
+        return;
+      }
+      followLine(position);
+    break;
+  }
+}
+
+// ------------------------------------------------------------ MODE FUNCTIONS ------------------------------------------------------------
+void handleModeFindFirst(){
+  uint16_t position = qtr.readLineBlack(sensorValues);
+  bool leftBlack    = leftSideBlack();
+  bool rightBlack   = rightSideBlack();
+  int numBlackLines = countBlackLines();
+
+  if((numBlackLines >= 3) && (leftBlack || rightBlack)){
+    digitalWrite(LED_BUILTIN, HIGH);
+    if(RETURNING){
+      NODE--;
+      leftHandRule(leftBlack, rightBlack);
+    }
+    else{
+      if(NODE == 301){
+        NODE = 2;
+        leftHandRule(leftBlack, rightBlack);
+      }else{
+        NODE++;
+        rightHandRule(leftBlack, rightBlack);
+      }
+    }
+    return;
+  }
+  digitalWrite(LED_BUILTIN, LOW);
+  if(numBlackLines == 0){
+    if(RETURNING && (NODE <= 0)){
+      Serial.println("Home");
+      dropObject();
+      turnAround();
+      RETURNING = false;
+      digitalWrite(LED_OTHER, LOW);
+      NODE = 0;
+      numSaved++;
+      if(numSaved >= 3){
+        victoryRoyal();
+        return;
+      }
+      if(middleEmpty){
+        if(exploreEmpty){
+          mode = MODE_FINDFIRST;
+        }
+        else{
+          mode = MODE_EXPLORE;
+        }
+      }else{
+        mode = MODE_ISLAND;
+      }
+    }
+    else{
+      Serial.println("Wall to close");
+      turnAround();
+    } 
+    return;
+  }
+  if(bumperPressed() && !RETURNING){
+    Serial.println("Found object!");
+    pickupObject();
+    turnAround();
+    RETURNING = true;
+    digitalWrite(LED_OTHER, HIGH);
+    return;
+  }
+  followLine(position);
+}
+
+void handleModeIsland(){
+  uint16_t position = qtr.readLineBlack(sensorValues);
+  bool leftBlack    = leftSideBlack();
+  bool rightBlack   = rightSideBlack();
+  int numBlackLines = countBlackLines();
+  
+  if((numBlackLines >= 3) && (leftBlack || rightBlack)){
+    digitalWrite(LED_BUILTIN, HIGH);
+    if(RETURNING){
+      if(NODE == 5){
+        NODE = 3;
+        leftHandRule(leftBlack, rightBlack);
+      }
+      else if(NODE <= 3){
+        leftHandRule(leftBlack, rightBlack);
+        NODE--;
+      }
+      else {
+        rightHandRule(leftBlack, rightBlack);
+        NODE--;
+      }
+    }
+    else{
+      if(NODE <= 2){
+        rightHandRule(leftBlack, rightBlack);
+        NODE++;
+      }
+      else if(NODE == 10){
+        middleEmpty = true;
+        if(exploreEmpty){
+          leftHandRule(leftBlack, rightBlack);
+          NODE = 301;
+          mode = MODE_FINDFIRST;
+        }
+        else{
+          setMotorSpeeds(BASE_SPEED, BASE_SPEED);
+          delay(250);
+          NODE = 3;
+          mode = MODE_EXPLORE; 
+        }
+      }
+      else{
+        leftHandRule(leftBlack, rightBlack);
+        NODE++;
+      }
+    }
+    return;
+  }
+  digitalWrite(LED_BUILTIN, LOW);
+  if(numBlackLines == 0){
+    if(RETURNING && (NODE <= 0)){
+      Serial.println("Home");
+      dropObject();
+      turnAround();
+      RETURNING = false;
+      digitalWrite(LED_OTHER, LOW);
+      NODE = 0;
+      numSaved++;
+      if(numSaved >= 3){
+        victoryRoyal();
+      }
+      else{
+        mode = MODE_EXPLORE;
+      }
+    }
+    else{
+      turnAround();
+    }
+    return;
+  }
+  if(bumperPressed() && !RETURNING){
+    Serial.println("Found object!");
+    pickupObject();
+    turnAround();
+    RETURNING = true;
+    digitalWrite(LED_OTHER, HIGH);
+    return;
+  }
+  followLine(position);
+}
+
+void handleModeExplore(){
+  uint16_t position = qtr.readLineBlack(sensorValues);
+  bool leftBlack    = leftSideBlack();
+  bool rightBlack   = rightSideBlack();
+  int numBlackLines = countBlackLines();
+
+  if((numBlackLines >= 3) && (leftBlack || rightBlack)){
+    digitalWrite(LED_BUILTIN, HIGH);
+    if(RETURNING){
+      if((NODE >= 220) && (NODE <= 231)){
+        NODE--;
+        leftHandRule(leftBlack, rightBlack);
+      }
+      else if(NODE == 219){
+        NODE = 0;
+        leftHandRule(leftBlack, rightBlack);
+      }
+      else if((NODE >= 115) && (NODE <= 120)){
+        NODE--;
+        leftHandRule(leftBlack, rightBlack);
+      }
+      else if(NODE == 114){
+        NODE--;
+        rightHandRule(leftBlack, rightBlack);
+      }
+      else if(NODE >= 111 && NODE <= 113){
+        NODE--;
+        leftHandRule(leftBlack, rightBlack);
+      }
+      else if(NODE == 110){
+        NODE = 0;
+        leftHandRule(leftBlack, rightBlack);
+      }
+      else if(NODE == 6){
+        setMotorSpeeds(BASE_SPEED, BASE_SPEED);
+        delay(250);
+        NODE = 2;
+      }
+      else{
+        NODE--;
+        rightHandRule(leftBlack, rightBlack);
+      }
+    }
+    else{
+      if(NODE == 39){
+        rightHandRule(leftBlack, rightBlack);
+        NODE = 6;
+        mode = MODE_ISLAND;
+      }
+      else if(NODE == 30){
+        NODE++;
+        rightHandRule(leftBlack, rightBlack);
+      }
+      else if(NODE == 18){
+        exploreEmpty = true;
+        NODE++;
+        leftHandRule(leftBlack, rightBlack);
+      }
+      else if(NODE == 3){
+        NODE++;
+        rightHandRule(leftBlack, rightBlack);
+      }
+      else{
+        NODE++;
+        leftHandRule(leftBlack, rightBlack);
+      }
+    }
+    return;
+  }
+  digitalWrite(LED_BUILTIN, LOW);
+  if(numBlackLines == 0){
+    if(NODE == 7){
+      setMotorSpeeds(BASE_SPEED+5, BASE_SPEED);
+    }
+    else if(NODE == 15){
+      setMotorSpeeds(0,0);
+      setMotorSpeeds(BASE_SPEED, BASE_SPEED);
+      delay(925);
+      setMotorSpeeds(0,0);
+      setMotorSpeeds(-TURN_SPEED, TURN_SPEED);
+      delay(750); 
+      setMotorSpeeds(BASE_SPEED, BASE_SPEED);
+      do{
+        qtr.readLineBlack(sensorValues);
+      }while(countBlackLines() == 0);
+    }
+    else if(NODE == 115 || NODE == 21){
+      setMotorSpeeds(TURN_SPEED+5, TURN_SPEED);
+    }
+    else if(RETURNING && (NODE == 0)){
+      Serial.println("Home");
+      dropObject();
+      turnAround();
+      RETURNING = false;
+      digitalWrite(LED_OTHER, LOW);
+      NODE = 0;
+      numSaved++;
+      if(numSaved >= 3){
+        victoryRoyal();
+        return;
+      }
+      if(middleEmpty){
+        if(exploreEmpty){
+          mode = MODE_FINDFIRST;
+        }
+        else{
+          mode = MODE_EXPLORE;
+        }
+      }
+      else{
+        mode = MODE_ISLAND;
+      }
+    }
+    else{
+      turnAround();
+    }
+    return;
+  }
+  if(bumperPressed() && !RETURNING){
+    Serial.println("Found object!");
+    pickupObject();
+    RETURNING = true;
+    digitalWrite(LED_OTHER, HIGH);
+    if(NODE != 21){
+      turnAround();
+    }
+    else if(NODE == 21){
+      NODE = 114;
+      setMotorSpeeds(TURN_SPEED, TURN_SPEED);
+      delay(250);
+    }
+
+    if((NODE >= 15) && (NODE <= 20)){
+      NODE = NODE + 100;
+    }else if((NODE >= 22) && (NODE <= 31)){
+      NODE = NODE + 200;
+    }
+    return;
+  }
+  followLine(position);
+}
